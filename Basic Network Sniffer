@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+Basic Network Sniffer (Scapy)
+
+Captures packets, then prints source/destination, protocol, ports,
+TCP flags, DNS queries and a payload preview for each one.
+
+Run with root/admin privileges:
+    sudo python3 sniffer.py                       # sniff on default interface
+    sudo python3 sniffer.py -i eth0 -c 50         # 50 packets on eth0
+    sudo python3 sniffer.py -f "tcp port 80"      # BPF filter
+    sudo python3 sniffer.py -w capture.pcap       # also save to a pcap file
+
+Only capture traffic on networks you own or are authorized to monitor.
+"""
+
+import argparse
+from datetime import datetime
+
+from scapy.all import (
+    ARP, DNS, DNSQR, ICMP, IP, IPv6, TCP, UDP, Raw,
+    PcapWriter, sniff,
+)
+
+PROTO_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6"}
+TCP_FLAGS = {"F": "FIN", "S": "SYN", "R": "RST", "P": "PSH",
+             "A": "ACK", "U": "URG", "E": "ECE", "C": "CWR"}
+
+packet_count = 0
+pcap_writer = None
+
+
+def payload_preview(data: bytes, limit: int = 64) -> str:
+    """Return hex + printable-ASCII preview of the first `limit` bytes."""
+    chunk = data[:limit]
+    hex_part = chunk.hex(" ")
+    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+    more = " ..." if len(data) > limit else ""
+    return f"{hex_part}{more}\n      ASCII: {ascii_part}{more}"
+
+
+def describe_flags(flags) -> str:
+    return ",".join(TCP_FLAGS[f] for f in str(flags) if f in TCP_FLAGS) or "none"
+
+
+def handle_packet(pkt):
+    global packet_count
+    packet_count += 1
+
+    if pcap_writer:
+        pcap_writer.write(pkt)
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[{packet_count}] {ts}  length={len(pkt)} bytes")
+
+    # Layer 2: ARP has no IP layer
+    if pkt.haslayer(ARP):
+        arp = pkt[ARP]
+        op = "request" if arp.op == 1 else "reply" if arp.op == 2 else str(arp.op)
+        print(f"  ARP {op}: {arp.psrc} ({arp.hwsrc}) -> {arp.pdst} ({arp.hwdst})")
+        return
+
+    # Layer 3
+    if pkt.haslayer(IP):
+        ip = pkt[IP]
+        proto = PROTO_NAMES.get(ip.proto, str(ip.proto))
+        print(f"  IPv4  {ip.src} -> {ip.dst}  proto={proto}  ttl={ip.ttl}")
+    elif pkt.haslayer(IPv6):
+        ip6 = pkt[IPv6]
+        print(f"  IPv6  {ip6.src} -> {ip6.dst}  next-header={ip6.nh}")
+    else:
+        print(f"  Other frame: {pkt.summary()}")
+        return
+
+    # Layer 4
+    if pkt.haslayer(TCP):
+        tcp = pkt[TCP]
+        print(f"  TCP   {tcp.sport} -> {tcp.dport}  flags={describe_flags(tcp.flags)}"
+              f"  seq={tcp.seq}  ack={tcp.ack}")
+    elif pkt.haslayer(UDP):
+        udp = pkt[UDP]
+        print(f"  UDP   {udp.sport} -> {udp.dport}  len={udp.len}")
+    elif pkt.haslayer(ICMP):
+        icmp = pkt[ICMP]
+        print(f"  ICMP  type={icmp.type} code={icmp.code}")
+
+    # Application layer: DNS
+    if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
+        qname = pkt[DNSQR].qname.decode(errors="replace")
+        kind = "response" if pkt[DNS].qr else "query"
+        print(f"  DNS   {kind}: {qname}")
+
+    # Payload
+    if pkt.haslayer(Raw):
+        raw = bytes(pkt[Raw].load)
+        print(f"  Payload ({len(raw)} bytes):")
+        print(f"      HEX: {payload_preview(raw)}")
+
+
+def main():
+    global pcap_writer
+
+    parser = argparse.ArgumentParser(description="Basic network sniffer")
+    parser.add_argument("-i", "--iface", help="interface to sniff on (default: Scapy's default)")
+    parser.add_argument("-c", "--count", type=int, default=0,
+                        help="number of packets to capture (0 = until Ctrl+C)")
+    parser.add_argument("-f", "--filter", default=None,
+                        help='BPF filter, e.g. "tcp port 443" or "udp port 53"')
+    parser.add_argument("-w", "--write", help="save captured packets to a .pcap file")
+    args = parser.parse_args()
+
+    if args.write:
+        pcap_writer = PcapWriter(args.write, append=False, sync=True)
+
+    print(f"[*] Sniffing on {args.iface or 'default interface'}"
+          f"{f' filter={args.filter!r}' if args.filter else ''} - Ctrl+C to stop")
+
+    try:
+        sniff(iface=args.iface, filter=args.filter, prn=handle_packet,
+              count=args.count, store=False)
+    except PermissionError:
+        print("[!] Permission denied. Run with sudo / as Administrator.")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if pcap_writer:
+            pcap_writer.close()
+        print(f"\n[*] Done. Captured {packet_count} packets.")
+
+
+if __name__ == "__main__":
+    main()
